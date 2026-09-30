@@ -1,0 +1,34 @@
+# Core
+python-dotenv>=1.0.0
+pyyaml>=6.0.2
+pydantic>=2.9.0
+aiohttp>=3.10.0
+websockets>=12.0
+
+# Audio
+numpy>=1.26.0
+sounddevice>=0.5.0
+av>=12.0.0
+
+# STT
+faster-whisper>=1.1.0
+
+# LLM
+groq>=0.11.0
+
+# TTS
+piper-tts>=1.2.0
+
+# Telephony / WebRTC
+livekit>=0.18.0
+livekit-api>=0.8.0
+livekit-protocol>=0.8.0
+
+# Web framework
+fastapi>=0.115.0
+uvicorn>=0.30.0
+
+# Utils
+python-multipart>=0.0.9
+httpx>=0.27.0
+pytz>=2024.2

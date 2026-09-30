@@ -1,0 +1,140 @@
+# Cold Calling Agent Configuration
+
+# Compliance
+compliance:
+  # DNC scrubbing
+  dnc_check: true
+  internal_dnc_file: "data/internal_dnc.txt"
+  
+  # Calling hours (recipient local time)
+  calling_window_start: 8   # 8 AM
+  calling_window_end: 21    # 9 PM
+  
+  # AI disclosure
+  ai_disclosure: "This is an AI-powered call from {company_name}."
+  
+  # Recording disclosure
+  recording_disclosure: "This call may be recorded for quality and compliance purposes."
+  
+  # Max call duration (seconds)
+  max_call_duration: 600
+
+  # Demo only: lets a run happen outside the 8am-9pm window so the call flow
+  # can be demonstrated at any hour. The DNC check is never bypassed.
+  bypass_calling_hours: true
+  
+  # Abandoned call rate limit (per 30 days)
+  max_abandoned_rate: 0.03
+
+# Telephony
+telephony:
+  provider: "livekit"
+  livekit_url: "ws://localhost:7880"
+  livekit_api_key: "devkey"
+  livekit_api_secret: "secret"
+  sip_trunk_id: ""
+  
+  # Caller ID strategy
+  caller_id_rotation: true
+  caller_id_pool: ["+15551234567", "+15559876543"]
+  
+  # Ringing timeout (seconds)
+  ringing_timeout: 30
+
+# Voice Pipeline
+voice:
+  # STT — provider: groq (fast, open weights) or local (faster-whisper)
+  # "assemblyai" streams over their realtime WebSocket (one socket for the
+  # whole call, server-side end-of-turn). "groq" posts each finished
+  # utterance. "local" runs faster-whisper in-process.
+  stt_provider: "assemblyai"
+  stt_speech_model: "universal-3-5-pro"
+  # Biased into the recogniser so product and industry proper nouns survive.
+  stt_keyterms:
+    - "cold calling"
+    - "missed inbound calls"
+    - "phone system"
+    - "onboarding"
+    - "Northwind Logistics"
+  stt_model: "whisper-large-v3-turbo"  # local fallback: tiny, base, small
+  stt_language: "en"
+  stt_beam_size: 1  # greedy for speed (local only)
+  stt_vad_filter: true
+
+  # LLM
+  # Limits are per model, so each has its own TPM/TPD allowance.
+  #
+  # Measured time-to-first-sentence on the real prompt:
+  #   qwen/qwen3.8-27b    0.73s   <- chosen
+  #   openai/gpt-oss-120b 2.50s   (reasoning model: seconds of dead air)
+  #   openai/gpt-oss-20b  fails to call tools reliably
+  # Reasoning models are unusable in a voice loop however well they tool-call.
+  # Qwen has no prompt caching, so each turn bills the full prompt.
+  llm_provider: "groq"
+  llm_model: "qwen/qwen3.8-27b"
+  llm_temperature: 0.7
+  # gpt-oss is a reasoning model: it emits reasoning tokens before the tool
+  # call, and a small cap truncates the tool arguments mid-JSON. The SDK then
+  # raises "Failed to parse tool call arguments as JSON" and the call dies.
+  llm_max_tokens: 1024
+
+  # Half-duplex turn taking. A side may only speak after this much silence
+  # from the other. Covers a breath between words without handing the line
+  # over mid-sentence.
+  turn_silence_ms: 350
+  # Give up waiting for the other side after this long, so a wedged peer
+  # cannot hang the call.
+  turn_lock_timeout: 30.0
+  # Floor pause before each LLM turn. The real pacing is token-based
+  # (llm_tokens_per_minute below) because cost per turn grows with the
+  # conversation and the limit is per minute, not per call. A constant sleep
+  # is either dead air early or a 429 late.
+  turn_spacing: 0.3
+  # Silence after the agent's audio finishes before the line is released.
+  # Synthesis runs ahead of playback, so the pipeline must wait for the audio
+  # to actually play out. Production guidance puts the end-of-agent-speech to
+  # next-audio gap at 200-450ms; 0.3s is mid-range.
+  turn_gap: 0.3
+  # Published per-model free-plan budget, used to sanity-check pacing.
+  llm_tokens_per_minute: 8000
+  
+  # TTS
+  tts_engine: "piper"
+  tts_voice: "en_US-lessac-medium"
+  tts_speaking_rate: 1.0
+  # Separate voice for the simulated prospect, so the two speakers differ
+  prospect_tts_voice: "en_US-ryan-medium"
+
+# Dialer
+dialer:
+  # Hosted-LLM rate limit is per-minute input tokens (7000 ITPM on the free
+  # tier), so this is bounded by token budget, not CPU. Each turn resends the
+  # whole conversation, so a long call burns the budget quickly.
+  max_concurrent_calls: 1
+  calls_per_minute: 4
+  retry_attempts: 2
+  retry_delay_minutes: 30
+  
+  # Lead source
+  lead_source: "csv"
+  lead_file: "data/leads.csv"
+
+# Tools
+tools:
+  crm_webhook: "http://localhost:8080/api/crm"
+  calendar_webhook: "http://localhost:8080/api/calendar"
+  dnc_webhook: "http://localhost:8080/api/dnc"
+
+# Recording
+# Calls are written to WAV so a conversation can be listened to afterwards.
+# In a real deployment, consent and retention rules apply before this ships.
+recording:
+  enabled: true
+  out_dir: "data/calls"
+
+# Logging
+logging:
+  level: "INFO"
+  file: "logs/agent.log"
+  max_bytes: 10485760  # 10MB
+  backup_count: 5
