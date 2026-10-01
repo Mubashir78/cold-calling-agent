@@ -35,7 +35,7 @@ def _response_at(freq: float, aggressiveness: float = 1.0) -> float:
 
 def test_band_limit_attenuates_far_out_of_band():
     """6 kHz is well above telephony and should be strongly reduced."""
-    assert _response_at(6000.0) < 0.5
+    assert _response_at(6000.0) < 0.45
 
 
 def test_band_limit_preserves_the_speech_band():
@@ -44,8 +44,13 @@ def test_band_limit_preserves_the_speech_band():
 
 
 def test_band_limit_response_falls_with_aggressiveness():
-    soft = _response_at(3000.0, aggressiveness=0.3)
-    hard = _response_at(3000.0, aggressiveness=1.0)
+    """`aggressiveness` scales attenuation, so it must change the response.
+
+    Probed above the band edge, since below it the filter is now transparent by
+    design and every aggressiveness would give the same answer.
+    """
+    soft = _response_at(4500.0, aggressiveness=0.3)
+    hard = _response_at(4500.0, aggressiveness=1.0)
     assert hard < soft, "aggressiveness had no effect on the response"
 
 
@@ -130,3 +135,60 @@ def test_prospect_lines_have_no_placeholders():
             replace(script_for(key), company="Test Co"), tts=None
         )
         assert all("{company}" not in line for line in p.lines)
+
+
+def _tone_gain(sig, out, freq):
+    """Magnitude of `freq` in the filtered signal, relative to unfiltered."""
+    f = np.fft.rfftfreq(len(out), 1 / 16000)
+    i = int(np.argmin(np.abs(f - freq)))
+    return float(np.abs(np.fft.rfft(out))[i] / (np.abs(np.fft.rfft(sig))[i] or 1.0))
+
+
+def test_speech_band_survives_the_phone_filter():
+    """Regression: the filter gutted 3 kHz, which is speech, not sibilance.
+
+    `high_edge = PHONE_HIGH_HZ * 0.7` put the top of the skirt at 2380 Hz with
+    1020 Hz of width, so it reached full depth by 3400 Hz — and everything above
+    2380 was attenuated toward zero. A tone at 3000 Hz came out at exactly 0.0.
+    That is inside the intelligibility core of speech, and it is why the
+    prospect sounded garbled while the agent, whose audio is not filtered, was
+    clean.
+
+    Narrowband telephony is honestly lossy above ~3.4 kHz. It is not lossy at
+    1-3 kHz.
+    """
+    sr = 16000
+    t = np.arange(sr) / sr
+    for freq in (500, 1000, 2000, 3000):
+        sig = (0.3 * np.sin(2 * np.pi * freq * t)).astype(np.float32)
+        out = band_limit(sig.copy(), sr, aggressiveness=0.6)
+        gain = _tone_gain(sig, out, freq)
+        assert gain > 0.7, (
+            f"{freq} Hz attenuated to {gain:.2f} — inside the speech band"
+        )
+
+
+def test_filter_still_removes_true_out_of_band_energy():
+    """The filter must keep doing its job above the telephony band."""
+    sr = 16000
+    t = np.arange(sr) / sr
+    sig = (0.3 * np.sin(2 * np.pi * 6000 * t)).astype(np.float32)
+    out = band_limit(sig.copy(), sr, aggressiveness=0.6)
+    gain = _tone_gain(sig, out, 6000)
+    # 6 kHz is ~2.6 kHz above the edge, where the raised-cosine skirt with
+    # aggressiveness 0.6 has flattened to its floor. Assert the honest
+    # expectation: clearly reduced relative to in-band, not annihilated.
+    in_band = _tone_gain(sig, band_limit(
+        (0.3 * np.sin(2 * np.pi * 1000 * t)).astype(np.float32),
+        sr, aggressiveness=0.6), 1000)
+    assert gain < 0.5 * in_band, (
+        f"6 kHz passed at {gain:.2f}; the phone band ends at 3.4 kHz"
+    )
+
+
+def test_aggressiveness_zero_is_a_no_op():
+    sr = 16000
+    t = np.arange(sr) / sr
+    sig = (0.3 * np.sin(2 * np.pi * 5000 * t)).astype(np.float32)
+    out = band_limit(sig.copy(), sr, aggressiveness=0.0)
+    assert _tone_gain(sig, out, 5000) > 0.95

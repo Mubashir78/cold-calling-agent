@@ -160,23 +160,6 @@ class GroqLLM:
         for attempt in range(self.max_retries + 1):
             try:
                 return await coro_factory()
-            except APIError as exc:
-                # Recoverable tool-shape failures: drop the schemas for this
-                # turn and reply in plain text. Losing a turn beats losing the
-                # call. Groq words these several different ways, so match
-                # loosely on the tool-shape family rather than one phrase.
-                text = str(exc).lower()
-                recoverable = (
-                    "tool call" in text
-                    or "called a tool" in text
-                    or "tool choice" in text
-                    or "tool call validation" in text
-                )
-                if recoverable:
-                    logger.warning("Tool-shape error (%s); replying as text",
-                                   text[:60])
-                    raise MalformedToolCall(str(exc)) from exc
-                raise
             except RateLimitError as exc:
                 last = exc
                 if self.is_daily_exhausted(exc):
@@ -196,6 +179,22 @@ class GroqLLM:
                     raise DailyTokenLimitExceeded(
                         "Groq daily token budget exhausted on all models"
                     ) from exc
+                # A per-minute limit is also per model, so some other model's
+                # allowance is very likely untouched. Switching is instant;
+                # sleeping out the minute is not, and the caller hears every
+                # second of it as "sorry, one moment".
+                #
+                # Rotating here marks the model exhausted for the life of this
+                # client, so it will not return to the fastest model once the
+                # minute resets. A call is short enough that this does not
+                # matter, and a call that kept re-probing a throttled model
+                # would keep paying the stall.
+                if self._rotate_model():
+                    logger.warning(
+                        "Rate limited; switching to %s rather than waiting",
+                        self.model,
+                    )
+                    return await self._with_backoff(coro_factory)
                 elapsed = asyncio.get_event_loop().time() - started
                 if attempt == self.max_retries:
                     break
@@ -216,6 +215,23 @@ class GroqLLM:
                     wait, attempt + 1, self.max_retries, elapsed,
                 )
                 await asyncio.sleep(wait)
+            except APIError as exc:
+                # Recoverable tool-shape failures: drop the schemas for this
+                # turn and reply in plain text. Losing a turn beats losing the
+                # call. Groq words these several different ways, so match
+                # loosely on the tool-shape family rather than one phrase.
+                text = str(exc).lower()
+                recoverable = (
+                    "tool call" in text
+                    or "called a tool" in text
+                    or "tool choice" in text
+                    or "tool call validation" in text
+                )
+                if recoverable:
+                    logger.warning("Tool-shape error (%s); replying as text",
+                                   text[:60])
+                    raise MalformedToolCall(str(exc)) from exc
+                raise
         raise last  # type: ignore[misc]
 
     def suggest_turn_spacing(self, tokens_per_turn: int) -> float:
@@ -279,6 +295,26 @@ class GroqLLM:
                 self.model = candidate
                 return True
         return False
+
+    async def complete(self, prompt: str) -> str:
+        """One prompt in, one string out.
+
+        The far end -- the simulated caller -- has no tools and no message
+        list of its own, just a prompt describing the conversation so far. It
+        needs the simplest possible entry point.
+
+        Routed through `generate` rather than calling the API directly, so
+        rate-limit backoff, fallback-model rotation and usage accounting all
+        apply. The far end shares the agent's Groq budget, so a call that
+        bypassed those paths would fail where the agent would have survived.
+        """
+        chunks: list[str] = []
+        async for response in self.generate(
+            [Message(role="user", content=prompt)], stream=False
+        ):
+            if response.text:
+                chunks.append(response.text)
+        return "".join(chunks)
 
     async def generate(
         self,

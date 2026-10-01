@@ -48,11 +48,17 @@ def band_limit(
     spectrum = np.fft.rfft(audio)
     freqs = np.fft.rfftfreq(audio.size, d=1.0 / sample_rate)
 
-    # Skirt start points sit inside the nominal edge, not at it.
-    low_edge = low_hz * 0.7
-    high_edge = high_hz * 0.7
-    low_width = max(low_edge * 0.7, 1.0)
-    high_width = max(high_hz - high_edge, 1.0)
+    # Skirt start points sit AT the nominal band edges, not inside them.
+    #
+    # Placing them at 0.7x meant the top skirt began at 2380 Hz and reached full
+    # depth by 3400, so a 3 kHz tone came out at 0.51 gain and anything above
+    # 2380 was carved away. 3 kHz is inside the intelligibility core of speech,
+    # which is why the prospect sounded garbled while the unfiltered agent did
+    # not. Narrowband telephony is honestly lossy ABOVE 3.4 kHz, not at it.
+    low_edge = low_hz
+    high_edge = high_hz
+    low_width = max(low_hz * 0.6, 1.0)
+    high_width = max(high_hz * 0.6, 1.0)
 
     low = np.clip((low_edge - freqs) / low_width, 0.0, 1.0)
     high = np.clip((freqs - high_edge) / high_width, 0.0, 1.0)

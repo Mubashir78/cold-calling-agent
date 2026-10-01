@@ -91,16 +91,23 @@ voice:
   # Give up waiting for the other side after this long, so a wedged peer
   # cannot hang the call.
   turn_lock_timeout: 30.0
-  # Floor pause before each LLM turn. The real pacing is token-based
-  # (llm_tokens_per_minute below) because cost per turn grows with the
-  # conversation and the limit is per minute, not per call. A constant sleep
-  # is either dead air early or a 429 late.
-  turn_spacing: 0.3
+  # Pause before each LLM turn, in seconds.
+  #
+  # This was 0.3 and described as a floor for "token-based pacing", but nothing
+  # ever computed a token-derived value: `GroqLLM.suggest_turn_spacing` has no
+  # call site. So it was not pacing at all, just 300ms of silence added to
+  # every turn before the model request was even sent — about 19% of the
+  # measured 1.6s prospect-to-agent gap.
+  #
+  # Zero by default. Rate limiting is handled by rotating to another model
+  # rather than sleeping, so a blind pre-sleep cannot prevent a 429; it only
+  # adds audible hesitation to every turn.
+  turn_spacing: 0.0
   # Silence after the agent's audio finishes before the line is released.
   # Synthesis runs ahead of playback, so the pipeline must wait for the audio
   # to actually play out. Production guidance puts the end-of-agent-speech to
   # next-audio gap at 200-450ms; 0.3s is mid-range.
-  turn_gap: 0.3
+  turn_gap: 0.2
   # Published per-model free-plan budget, used to sanity-check pacing.
   llm_tokens_per_minute: 8000
   

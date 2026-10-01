@@ -191,6 +191,20 @@ async def main():
     ))
     await prospect_tts.initialize()
 
+    # The far end speaks too, so both sides of the call are generated. A small
+    # model is enough for a one-or-two-sentence reply and keeps this off the
+    # agent's token budget, which is the budget that decides whether a meeting
+    # gets booked.
+    prospect_llm = None
+    if voice.get("prospect_generates", True):
+        prospect_llm = GroqLLM(
+            model=voice.get("prospect_llm_model", llm.model),
+            temperature=float(voice.get("prospect_llm_temperature", 0.8)),
+            max_tokens=int(voice.get("prospect_llm_max_tokens", 64)),
+            api_key=os.getenv("GROQ_API_KEY"),
+            fallback_models=voice.get("llm_fallback_models", []),
+        )
+
     compliance = ComplianceGate(
         internal_dnc_file=config["compliance"]["internal_dnc_file"],
         calling_window_start=config["compliance"]["calling_window_start"],
@@ -235,6 +249,10 @@ async def main():
             script, prospect_tts,
             seed=abs(hash(lead.phone_number)) % 10_000,
             turns=turns,
+            # The far end is a participant, not a recording: it generates its
+            # own lines, so the agent is evaluated against a caller that
+            # actually answers what it was asked.
+            llm=prospect_llm,
         )
         await prospect.prime()
 
@@ -271,15 +289,24 @@ async def main():
             recorder=recording,
             coordinator=turns,
             playback=playback,
-            turn_spacing=voice.get("turn_spacing", 0.4),
+            turn_spacing=float(voice.get("turn_spacing", 0.0)),
         )
 
         audio_out: asyncio.Queue = asyncio.Queue()
         consumer = asyncio.create_task(playback.run(audio_out))
 
+        # Hand the pipeline its far end. Without this the agent's turns go
+        # nowhere: the caller is never told what was said, so it never has a
+        # reason to reply and the call ends after the agent's second turn.
+        pipeline.on_far_end_turn = prospect
+
         started = time.time()
         try:
             await pipeline.run_call(
+                # The far end is told each agent turn so it can prepare an
+                # answer while that turn is still playing. That overlap is what
+                # keeps the gap short: otherwise it has to generate and
+                # synthesize from scratch the moment the line frees.
                 prospect.stream(),
                 audio_out,
                 opening=_opening_for(lead),

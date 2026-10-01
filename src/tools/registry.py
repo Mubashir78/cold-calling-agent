@@ -185,6 +185,28 @@ class ToolRegistry:
                 return {"success": False, "error": str(exc)}
         return args
 
+    @property
+    def booked_this_call(self) -> bool:
+        """Whether a meeting has been booked on this call.
+
+        Read by the pipeline to know the call has reached its purpose. Without
+        a public accessor the pipeline would have to reach into a private
+        field, and the "the call is over" decision would be invisible to
+        anything else watching the call.
+        """
+        return self._booked_this_call
+
+    @property
+    def terminal(self) -> bool:
+        """Whether the call has achieved a result that ends it.
+
+        A booking or a DNC request is a completed outcome, not a topic. The
+        agent still gets to finish the turn it is speaking -- that turn carries
+        the confirmation -- but the call ends there rather than the agent
+        returning to confirm a second and third time.
+        """
+        return self._booked_this_call or self._dnc_this_call
+
     async def execute(self, name: str, arguments: dict) -> dict:
         """Execute a tool call."""
         if name not in self._tools:

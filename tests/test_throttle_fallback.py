@@ -6,11 +6,12 @@ call, so there must always be something to say.
 """
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 from groq import RateLimitError
 
-from llm.client import LLMResponse
+from llm.client import GroqLLM, LLMResponse
 from pipeline import VoicePipeline
 from stt.engine import TranscriptSegment
 from tools.registry import ToolRegistry
@@ -231,3 +232,67 @@ async def _consume(q: asyncio.Queue, rec) -> None:
             continue
         rec.add_playback(speaker, pcm)
         rec.mark_playback_finished(speaker, len(pcm) // 2)
+
+
+def test_per_minute_limit_switches_model_instead_of_sleeping():
+    """A 429 must cost the caller no silence when another model is free.
+
+    The free tier allows 8K tokens per minute *per model*, and a call with both
+    sides generating blows through that by the middle of the conversation. The
+    old response was to sleep and retry -- up to `retry_budget` (90s) of the
+    caller hearing "sorry, one moment" while a whole minute ticks over.
+
+    Budgets are per model, so another model's minute is almost certainly
+    untouched. Switching is instant; waiting is not. The call keeps its pace
+    and the prospect never hears a stall.
+    """
+    slept: list[float] = []
+
+    real_sleep = asyncio.sleep
+
+    async def _fake_sleep(seconds, *a, **kw):
+        slept.append(seconds)
+        return await real_sleep(0)
+
+    state = {"first": True}
+
+    async def _create(**kwargs):
+        # The first request is throttled; once rotated, the backup answers.
+        if state["first"]:
+            state["first"] = False
+            raise _rate_limited()
+        return SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(content="Wednesday works.",
+                                        tool_calls=None),
+                finish_reason="stop",
+            )],
+            usage=SimpleNamespace(prompt_tokens=10, completion_tokens=4),
+        )
+
+    llm = GroqLLM(
+        model="primary/model", api_key="k",
+        fallback_models=["backup/model"], max_retries=2, retry_budget=90.0,
+    )
+    llm.client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=_create))
+    )
+
+    asyncio.sleep = _fake_sleep
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        text = loop.run_until_complete(llm.complete("When works for you?"))
+    finally:
+        asyncio.set_event_loop(None)
+        loop.close()
+        asyncio.sleep = real_sleep
+
+    assert text == "Wednesday works.", (
+        "the call failed even though a fallback model's budget was free"
+    )
+    assert slept == [], (
+        f"the caller waited {sum(slept):.1f}s of silence when switching "
+        f"models was instant"
+    )
+    assert llm.active_model == "backup/model"

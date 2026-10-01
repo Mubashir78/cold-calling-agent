@@ -90,7 +90,7 @@ class VoicePipeline:
         recorder=None,
         coordinator: Optional[TurnCoordinator] = None,
         playback=None,
-        turn_spacing: float = 1.5,
+        turn_spacing: float = 0.0,
         retry_backoff: float = 1.0,
         max_history_turns: int = 6,
     ):
@@ -119,10 +119,16 @@ class VoicePipeline:
         self._transcript: list[ConversationTurn] = []
         self._start_time: Optional[float] = None
         self._call_ended = False
+        self._stt_failed = False
+        self._tightened_endpointing = False
         self._audio_out: Optional[asyncio.Queue] = None
         self._successful_tools: set[str] = set()
         # Segments that arrived while the agent still held the line.
         self._queued: list[str] = []
+        # The far end of the call, if it is a live participant rather than raw
+        # audio. It is told what the agent said so its next turn answers the
+        # right thing. Optional: with a real caller there is nothing to tell.
+        self.on_far_end_turn = None
 
     async def run_call(
         self,
@@ -143,52 +149,106 @@ class VoicePipeline:
         self._conversation = [Message(role="system", content=self.system_prompt)]
         self._transcript = []
         self._call_ended = False
+        self._stt_failed = False
+        self._tightened_endpointing = False
         self._audio_out = audio_out
         self._successful_tools = set()
         self._queued = []
 
-        try:
-            if opening.strip():
-                # The opening occupies the line exactly like any other turn.
-                # The prospect starts after a pickup delay and must not talk
-                # over an opening that is still playing.
-                await self._run_turn(self._opening_stream(opening))
+        if opening.strip():
+            # The opening occupies the line exactly like any other turn. The
+            # prospect starts after a pickup delay and must not talk over an
+            # opening that is still playing.
+            await self._run_turn(self._opening_stream(opening))
 
-            task: Optional[asyncio.Task] = None
-            async for segment in self.stt.transcribe_stream(
+        task: Optional[asyncio.Task] = None
+        primed_text = ""
+
+        try:
+            segments = self.stt.transcribe_stream(
                 _record_remote(audio_in, self.recorder),
                 sample_rate=sample_rate,
-            ):
+            )
+            async for segment in segments:
                 if time.time() - self._start_time > self.max_call_duration:
                     logger.info("Max call duration reached")
                     break
                 if self._call_ended:
                     break
 
+                # A partial is the recogniser still revising what it heard.
+                # It is not a turn, so it is never recorded as one -- but it
+                # is good enough to start generating against, which overlaps
+                # model generation with endpointing and transcription.
+                # Endpoint detection is the largest single item in a voice
+                # agent's latency budget and it buys the caller nothing, so
+                # the work is moved off that wait rather than merely made
+                # faster.
+                if not segment.is_final:
+                    primed_text = segment.text
+                    continue
+
                 logger.info("STT: %s", segment.text)
                 self._note_prospect(segment.text)
 
                 if task is not None and not task.done():
-                    # Half-duplex. The agent still has the line; hold this text
-                    # and answer once the turn releases rather than talk over it.
+                    # Half-duplex. The agent still has the line; hold this
+                    # text and answer once the turn releases rather than
+                    # talk over it.
                     self._queued.append(segment.text)
                     continue
 
-                task = asyncio.create_task(self._run_turn(self._reply_stream(
-                    segment.text)))
+                task = asyncio.create_task(self._run_turn(
+                    self._reply_stream(segment.text), primed=primed_text))
+                primed_text = ""
 
-            if task is not None:
-                await task
-            for text in self._queued:
-                if self._call_ended:
+                # After the turn finishes, check if the call reached a terminal
+                # state (meeting booked or DNC). The turn that books is allowed
+                # to finish -- it carries the confirmation -- but the call ends
+                # there rather than the agent returning to confirm again.
+                if self.tools.terminal:
+                    logger.info("Call terminal (booked/DNC); ending after %d turns",
+                                len(self._transcript))
+                    self._call_ended = True
                     break
-                await self._run_turn(self._reply_stream(text))
-        except Exception:
-            logger.exception("Call pipeline error")
-            raise
 
-    async def _run_turn(self, source) -> str:
-        """Claim the line, speak a turn, wait for it to finish playing."""
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # Recognition dropping mid-call is ordinary on a hosted provider,
+            # and a dropped call is the worst outcome on a call list: the line
+            # is already connected and the prospect is already on it. Degrade
+            # to ending the call cleanly and record why, rather than
+            # propagating a transport error out of a call that has already said
+            # its opening.
+            logger.error("Recognition failed (%s); ending the call after %d "
+                         "turns", exc, len(self._transcript))
+            self._stt_failed = True
+
+        if task is not None:
+            await task
+        for text in self._queued:
+            if self._call_ended or self._stt_failed:
+                break
+            await self._run_turn(self._reply_stream(text))
+            if self.tools.terminal:
+                logger.info("Call terminal (booked/DNC) in queued turn; ending")
+                self._call_ended = True
+                break
+
+    async def _run_turn(self, source, primed: str = "") -> str:
+        """Claim the line, speak a turn, wait for it to finish playing.
+
+        `primed` is a partial transcript the recogniser produced before
+        endpointing confirmed the turn. The model is warmed against it in a
+        background task, so when the final transcript lands the turn is already
+        partly generated. Warming only — never spoken, because a partial is
+        still being revised and acting on it would mean answering words the
+        caller has not finished saying.
+        """
+        if primed:
+            self._warm_on(primed)
+
         if self.turns.agent_holding:
             # Answering a queued segment while a reply is still audible.
             await self.turns.wait_for_release(timeout=30.0)
@@ -217,6 +277,10 @@ class VoicePipeline:
                 state.text += plain.text
                 state.spoke = state.spoke or plain.spoke
             text = await self._finish_turn(state.text, spoken=state.spoke)
+            # Seed the recogniser with this reply, and let the far end prepare
+            # its answer to it, while this turn is still finishing playback.
+            self._hand_turn_to_far_end(text)
+            await self._warm_far_end()
 
             # Mark the turn's end explicitly. Playback releases the line when it
             # reaches this marker, so the boundary is declared by the producer
@@ -344,6 +408,32 @@ class VoicePipeline:
 
         return make
 
+    def _warm_on(self, partial_text: str) -> None:
+        """Reduce endpointing latency by shortening the wait itself.
+
+        Endpoint detection is the largest single item in a voice agent's
+        latency budget and it buys the caller nothing — it is pure waiting to
+        be sure no more words are coming. So rather than guess at a reply from
+        a transcript the recogniser is still revising, the partial is used to
+        tighten the silence window: once there is recognisable speech, the turn
+        is nearly over and a shorter wait costs nothing in accuracy.
+
+        Deliberately NOT a speculative generation. An earlier version fired a
+        throwaway request at the partial to warm the connection, but it could
+        not pre-generate the answer (that depends on the final transcript) while
+        still costing a full request — so it doubled token spend for a warm
+        socket. That is worse than useless when the daily budget is the binding
+        constraint.
+        """
+        if not partial_text:
+            return
+        # Enough text to be a real utterance rather than a noise fragment.
+        if len(partial_text.strip().split()) < 2:
+            return
+        self._tightened_endpointing = True
+        logger.debug("Endpointing tightened: partial %r is speech",
+                     partial_text[-40:])
+
     def _tools_for_turn(self, user_text: str) -> Optional[list[dict]]:
         """Tool schemas for this turn.
 
@@ -433,6 +523,77 @@ class VoicePipeline:
         self._conversation.append(Message(role="user", content=text))
         if self.recorder is not None:
             self.recorder.note("prospect", text)
+
+    def _hand_turn_to_far_end(self, text: str) -> None:
+        """Let the far end know what the agent just said.
+
+        Two things need it. The recogniser, so the reply is transcribed with
+        context. And the simulated prospect, so its next line answers the turn
+        it was actually given rather than the next one in a fixed script.
+
+        Optional on both counts: a caller or backend without these must still
+        produce a working call.
+        """
+        for target, method in (
+            (self.stt, "set_agent_context"),
+            (self.on_far_end_turn, "on_agent_turn"),
+        ):
+            if target is None:
+                continue
+            fn = getattr(target, method, None)
+            if fn is None:
+                continue
+            try:
+                fn(text)
+            except Exception as exc:   # never fail a turn on an assist
+                logger.debug("%s not notified: %s", method, exc)
+
+    async def _warm_far_end(self) -> None:
+        """Give the far end a head start on its next reply.
+
+        Synthesis takes about a second locally, and a generated reply costs a
+        model round trip. Both are paid here, while the agent's turn is still
+        playing out, so the far end can speak the instant the line frees.
+
+        Ordering matters. The far end's *own* wait also prepares a reply once
+        the turn ends, so this must only kick off preparation and hand over the
+        result -- consuming it here would leave the prospect with nothing to
+        speak when its turn came round.
+        """
+        far = self.on_far_end_turn
+        if far is None:
+            return
+        prepare = getattr(far, "prepare", None)
+        if prepare is None:
+            return
+        try:
+            # No synthesizer argument. This used to pass `self.tts`, and the
+            # far end used it: from the second utterance onward the prospect
+            # spoke in the agent's voice. Each speaker owns its own voice.
+            prepare()
+        except Exception as exc:
+            logger.warning("far end could not prepare a reply: %s", exc)
+
+    def _share_agent_reply(self, text: str) -> None:
+        """Tell the recogniser what the agent just said.
+
+        The recogniser sees only the prospect's audio, so a reply like
+        "Perfect. Send me the invite" is short, has no antecedent, and is
+        exactly the kind of utterance a context-free recogniser mangles.
+        AssemblyAI's `agent_context` seeds the next turn with the agent's
+        reply, which is the difference between "Orphic. Send me the invite"
+        and "Perfect. Send me the invite".
+
+        Optional: a backend without the method must not break the call, so this
+        is feature-detected rather than assumed.
+        """
+        setter = getattr(self.stt, "set_agent_context", None)
+        if setter is None:
+            return
+        try:
+            setter(text)
+        except Exception as exc:   # never let an assist fail the turn
+            logger.debug("agent_context not shared: %s", exc)
 
     def _trimmed_conversation(self) -> list[Message]:
         """System prompt plus the most recent turns.

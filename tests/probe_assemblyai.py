@@ -66,11 +66,21 @@ async def main() -> int:
         for block in blocks:
             for i in range(0, len(block), frame):
                 yield block[i:i + frame]
-                await asyncio.sleep(FRAME_MS / 1000)   # real time
+                # Real time, without exception. AssemblyAI's docs are explicit
+                # that sending faster than real time "can produce inconsistent
+                # Turn messages" -- and it did: the probe reported fragments
+                # like "Go!" where the recording says "Oh, hi. What's this
+                # about?". The recogniser was right; the probe was lying.
+                await asyncio.sleep(FRAME_MS / 1000)
 
     got: list[str] = []
     try:
         async for segment in stt.transcribe_stream(audio(), sample_rate=RATE):
+            # Partials are emitted for latency priming; only completed turns
+            # are transcript.
+            if not segment.is_final:
+                print(f"  partial: {segment.text!r}")
+                continue
             got.append(segment.text)
             print(f"  segment: {segment.text!r} "
                   f"({segment.start:.2f}-{segment.end:.2f}s)")

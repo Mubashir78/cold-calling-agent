@@ -20,6 +20,7 @@ from typing import AsyncIterator, Optional
 
 import numpy as np
 
+from sim.dialogue import Conversation, persona_for
 from sim.environment import (
     add_noise_bed,
     band_limit,
@@ -136,6 +137,7 @@ class SimulatedProspect:
         pickup_delay: Optional[float] = None,
         phone_filter: bool = True,
         seed: int = 0,
+        llm=None,
     ):
         # The script supplies the persona; the lead supplies the identity, so a
         # receptionist answers as the company actually called.
@@ -152,16 +154,89 @@ class SimulatedProspect:
         self.phone_filter = phone_filter
         self.rng = np.random.default_rng(seed)
         self._line_cache: dict[str, bytes] = {}
+        self._spoken: list[str] = []
+        self._last_agent_turn: str = ""
+        # Text of the reply that was generated during the agent's turn. Paired
+        # with the cached audio under "__prepared__".
+        self._prepared_text: Optional[str] = None
+
+        # The prospect generates its own lines. Both sides of this call are then
+        # language models talking to each other, which is the honest shape of
+        # the problem — a scripted far end produces a scripted conversation, and
+        # it answers a question that was never asked.
+        #
+        # Each persona carries a goal and a turn budget so the model is steered
+        # rather than left to improvise: a free-running caller keeps talking past
+        # the end of the call.
+        self._persona = persona_for(_persona_key(script), script.company)
+        self._conversation = Conversation(self._persona, llm=llm)
+        # Only the first line is scripted. That is the "hello?" before the agent
+        # has said anything; every line after it answers a real turn.
+        self._opening_lines = self.lines[:1]
 
     def heard(self) -> list[str]:
         return list(self.lines)
 
     async def prime(self) -> None:
-        """Pre-synthesize every line so playback is not blocked on synthesis."""
+        """Pre-synthesize the opening lines so playback is not blocked.
+
+        Only the opening line is scripted, so only it can be pre-synthesized.
+        Every later line is generated in response to the agent, and is prepared
+        during that agent's turn instead — see `prepare`.
+        """
         self._line_cache = {}
-        for line in self.lines:
+        for line in self._opening_lines:
             pcm = await self.tts.synthesize_pcm(line)
             self._line_cache[line] = self._condition(pcm)
+
+    def on_agent_turn(self, text: str) -> None:
+        """Record what the agent said.
+
+        Called as each agent turn completes. The reply is generated and
+        synthesized by `warm_next_reply`, which the pipeline awaits while this
+        turn is still playing out.
+        """
+        self._last_agent_turn = text or ""
+        self._conversation.note_agent_said(self._last_agent_turn)
+
+    def prepare(self) -> None:
+        """Begin generating and synthesizing the answer to this agent turn.
+
+        Called while the agent is still speaking. Without this the prospect
+        cannot reply until it has both generated and synthesized, which is
+        seconds of dead air after every agent turn — the single largest source
+        of the gap in this call.
+
+        Deliberately takes no synthesizer argument. It used to accept one and
+        forward it to `Conversation.prepare`, and the pipeline passed its OWN
+        TTS. That object synthesized the prospect's reply, so from the second
+        utterance onward the caller spoke in the agent's voice — the transcript
+        still said `prospect:`, so nothing looked wrong except the audio. The
+        voice belongs to the speaker, so it is not a parameter.
+        """
+        self._conversation.prepare(self.tts)
+
+    async def warm_next_reply(self) -> None:
+        """Wait for the prepared reply, then cache audio and text together.
+
+        Both are stashed. The audio is what plays; the text is what advances
+        the conversation, so losing it makes the far end mute on every turn
+        after the first.
+        """
+        prepared = await self._conversation.take_prepared(
+            self.tts, condition=self._condition)
+        if prepared:
+            pcm, text = prepared
+            self._line_cache["__prepared__"] = pcm
+            self._prepared_text = text
+
+    def _next_line(self, index: int) -> Optional[str]:
+        """The text of this turn, or None when the conversation is over."""
+        if self._conversation.should_stop:
+            return None
+        if index == 0 and self._opening_lines:
+            return self._opening_lines[0]
+        return self._prepared_text
 
     def _condition(self, pcm: bytes) -> bytes:
         """Put synthesized speech through a phone line."""
@@ -227,32 +302,74 @@ class SimulatedProspect:
                 yield chunk
 
         loop = asyncio.get_event_loop()
-        for index, line in enumerate(self.lines):
-            if (self.script.hangup_probability and index > 0
+        said = 0
+        while True:
+            if (self.script.hangup_probability and said > 0
                     and self.rng.random() < self.script.hangup_probability):
-                logger.info("Prospect hung up early at line %d", index)
+                logger.info("Prospect hung up early after %d turns", said)
                 break
 
-            async for chunk in self._yield_pcm(self._line_cache.get(line, b"")):
+            # The reply generated during the agent's turn. Taken before any
+            # waiting, so the audio is already conditioned and ready the
+            # instant the line frees.
+            prepared = self._line_cache.pop("__prepared__", None)
+
+            line = self._next_line(said)
+            if line is None and prepared is None:
+                break
+
+            if prepared is not None:
+                pcm = prepared
+            else:
+                if line is None:
+                    break
+                pcm = self._line_cache.get(line)
+                if pcm is None:
+                    raw = await self.tts.synthesize_pcm(line)
+                    pcm = self._condition(raw)
+                    self._line_cache[line] = pcm
+
+            async for chunk in self._yield_pcm(pcm):
                 yield chunk
+            if line:
+                self._conversation.note_prospect_said(line)
+                self._spoken.append(line)
+                self._prepared_text = None
+            said += 1
 
-            if index >= len(self.lines) - 1:
+            if self._conversation.should_stop:
                 break
 
-            # Phase 1: the natural pause, then wait for the agent to claim the
-            # line. At the moment the prospect stops talking the agent has not
-            # started — endpointing and transcription have not happened yet —
-            # so waiting on "is it speaking?" would return immediately and the
-            # prospect would answer over the reply.
+            # Wait for the agent's whole turn. At the moment the prospect stops
+            # talking the agent has not started — endpointing and transcription
+            # have not happened yet — so waiting on "is it speaking?" would
+            # return immediately and the prospect would answer over the reply.
             deadline = loop.time() + AGENT_TURN_START_WAIT
-            async for chunk in self._yield_silence(self._gap_for(index)):
+            async for chunk in self._yield_silence(self._gap_for(said)):
                 yield chunk
-            async for chunk in self._wait_for_turn(deadline):
+            async for chunk in self._wait_and_prepare(deadline):
                 yield chunk
 
         # Line goes dead.
         async for chunk in self._yield_silence(1.0):
             yield chunk
+
+    async def _wait_and_prepare(self, deadline: float) -> AsyncIterator[bytes]:
+        """Wait for the agent's turn, and build our answer while we wait.
+
+        Preparation happens here rather than at the top of the loop because the
+        reply is generated *during* the agent's turn. Reading the prepared audio
+        before that point always found nothing: the prospect arrived at the top
+        of the loop, found no reply yet, waited, and then left with silence
+        because the reply it had just caused to be built was never read.
+        """
+        async for chunk in self._wait_for_turn(deadline):
+            yield chunk
+        # The turn is over; its text is on the conversation already.
+        if self._last_agent_turn:
+            self.prepare()
+            await self.warm_next_reply()
+
 
     async def _wait_for_turn(self, start_deadline: float) -> AsyncIterator[bytes]:
         """Wait for the agent's whole turn, emitting silence throughout.
@@ -283,3 +400,17 @@ class SimulatedProspect:
 
 def script_for(key: str) -> ProspectScript:
     return SCRIPTS[key]
+
+
+# Which persona a script maps onto. Keyed by persona name so the script stays
+# the behavioural description and the persona stays the voice.
+_PERSONA_BY_NAME = {
+    "interested": "interested",
+    "gatekeeper": "gatekeeper",
+    "do not call": "dnc",
+    "dnc": "dnc",
+}
+
+
+def _persona_key(script: ProspectScript) -> str:
+    return _PERSONA_BY_NAME.get((script.name or "").strip().lower(), "interested")
