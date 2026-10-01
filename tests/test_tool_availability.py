@@ -178,7 +178,7 @@ async def test_call_survives_a_tool_shape_error():
     tts = _TTS()
     p = _pipeline(_Flaky(), tts=tts)
 
-    out = await p._respond("Yes, let's do it.")
+    out = await p._run_turn(p._reply_stream("Yes, let's do it."))
 
     assert out == "Got it.", "no reply after a tool-shape error"
     assert tts.spoken, "no audio after a tool-shape error"

@@ -43,6 +43,10 @@ DEFAULT_HOST = "wss://streaming.assemblyai.com/v3/ws"
 # versioned. 3.5 Pro is the one that supports agent_context and keyterms.
 DEFAULT_MODEL = "universal-3-5-pro"
 
+# Milliseconds of audio per WebSocket message. The server accepts
+# 50-1000ms; 100ms sits comfortably inside that.
+FRAME_MS = 100
+
 
 class AssemblyAIRealtimeSTT:
     """Streaming STT over AssemblyAI's realtime WebSocket API."""
@@ -157,16 +161,33 @@ class AssemblyAIRealtimeSTT:
                     await queue.put(done)
 
             async def writer() -> None:
+                # AssemblyAI requires each binary message to hold 50-1000ms of
+                # audio. The pipeline emits 20ms chunks, which is below the
+                # minimum, and the server rejects the whole session with
+                # "Input Duration Violation" — the call dies about a second in.
+                # So re-frame on the way out. Deliberately no sleep: the
+                # producer already paces in real time, and adding a delay here
+                # would stretch the audio beyond its true duration.
+                frame_bytes = int(self._sample_rate * FRAME_MS / 1000) * 2
+                buf = bytearray()
                 try:
                     async for chunk in audio_stream:
                         if not chunk:
                             continue
-                        await socket.send(chunk)
+                        buf += chunk
+                        while len(buf) >= frame_bytes:
+                            await socket.send(bytes(buf[:frame_bytes]))
+                            del buf[:frame_bytes]
                 except websockets.ConnectionClosed:
                     logger.info("AssemblyAI socket closed while sending")
                 except Exception:
                     logger.exception("AssemblyAI writer failed")
                 finally:
+                    if buf:
+                        try:
+                            await socket.send(bytes(buf))
+                        except Exception:
+                            pass
                     # Ask the server to emit its last turn instead of dropping
                     # whatever the prospect said as the line went dead. v3
                     # requires an explicit `type` on client messages; the v2

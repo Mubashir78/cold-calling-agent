@@ -72,6 +72,12 @@ voice:
   # Qwen has no prompt caching, so each turn bills the full prompt.
   llm_provider: "groq"
   llm_model: "qwen/qwen3.8-27b"
+  # Groq budgets are per model, so one model exhausting its daily allowance
+  # says nothing about the others. The chain is tried in order when a model
+  # reports its daily budget spent. gpt-oss is slower to first token (it
+  # reasons before answering) but has an independent budget.
+  llm_fallback_models:
+    - "openai/gpt-oss-120b"
   llm_temperature: 0.7
   # gpt-oss is a reasoning model: it emits reasoning tokens before the tool
   # call, and a small cap truncates the tool arguments mid-JSON. The SDK then

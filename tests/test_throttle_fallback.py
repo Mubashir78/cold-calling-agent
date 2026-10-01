@@ -215,9 +215,19 @@ async def test_recording_is_written_even_when_the_call_fails():
 
 
 async def _consume(q: asyncio.Queue, rec) -> None:
-    """Stand in for playback, so audio can drain as fast as it is queued."""
+    """Stand in for playback.
+
+    Handles the end-of-turn marker, which carries no audio, so a turn with no
+    spoken output still completes instead of stalling the pipeline for its
+    full drain timeout.
+    """
     while True:
         item = await q.get()
-        speaker, pcm = item if isinstance(item, tuple) else ("agent", item)
+        speaker, pcm, turn_end = (
+            item if isinstance(item, tuple) and len(item) == 3
+            else ("agent", item, False)
+        )
+        if turn_end and not pcm:
+            continue
         rec.add_playback(speaker, pcm)
         rec.mark_playback_finished(speaker, len(pcm) // 2)

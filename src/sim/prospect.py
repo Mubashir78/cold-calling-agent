@@ -1,11 +1,16 @@
 """Simulated prospect.
 
 The PSTN is unreachable from a sandbox, so the far end is simulated. The
-simulation is honest about where it stops: the prospect's *voice* is real
-audio, synthesized by a second Piper voice, then put through the acoustic
-conditions of a real phone call — narrowband codec, room tone, a breath
-before anyone answers, a beep on voicemail. The agent therefore transcribes
-degraded audio, which is the condition it will meet in production.
+simulation is honest about where it stops: the prospect's voice is real audio,
+synthesized by a second Piper voice, then put through the acoustic conditions
+of a real phone call — narrowband codec, room tone, a breath before anyone
+answers, a beep on voicemail. The agent therefore transcribes degraded audio,
+which is the condition it will meet in production.
+
+On turn-taking: the prospect does not guess how long the agent's reply will
+take. It waits for `TurnCoordinator` to report the line free. Guessing was the
+original design and it failed in both directions — it cut the agent off when
+the guess ran long, and it sat out fixed dead air when the reply was short.
 """
 
 import asyncio
@@ -23,7 +28,6 @@ from sim.environment import (
     voicemail_beep,
 )
 from tts.engine import PiperTTS
-from turnlock import Speaker
 
 logger = logging.getLogger(__name__)
 
@@ -32,20 +36,17 @@ CHUNK_MS = 20
 CHUNK_BYTES = SAMPLE_RATE * 2 * CHUNK_MS // 1000
 SILENCE = b"\x00" * CHUNK_BYTES
 
-# A prospect does not resume talking the instant they stop. Human turn-taking
-# is 200-300ms of dead air; anything past ~1.5s stops reading as conversation
-# and starts reading as a query-response form. This is the *minimum* pause,
-# independent of how long the agent's turn actually took.
+# A prospect does not resume the instant they stop. Human turn-taking leaves
+# 200-300ms; past ~1.5s it stops reading as conversation and starts reading as
+# a query-response form. This is the floor, before the agent's reply.
 MIN_TURN_GAP = 0.2
 
-# Give up waiting for the agent after this long, so a silent agent cannot
-# hang the call forever.
-MAX_AGENT_WAIT = 25.0
-
-# How long the prospect will wait for the agent to even *start* its turn.
-# Covers endpointing plus a transcription round trip; the agent has not
-# claimed the floor at the moment the prospect stops talking.
+# Give up waiting for a reply that never comes, so a silent agent cannot hang
+# the call. Also bounds the phase where the agent is generating: at the moment
+# the prospect stops, the agent has not started, because transcription and
+# endpointing have not happened yet.
 AGENT_TURN_START_WAIT = 12.0
+MAX_AGENT_WAIT = 30.0
 
 
 @dataclass
@@ -56,13 +57,10 @@ class ProspectScript:
     company: str
     persona: str
     lines: list[str] = field(default_factory=list)
-    # Behavioral knobs, so the four scenarios do not all sound alike.
     speaking_rate: float = 1.0
     hangup_probability: float = 0.0
     voicemail: bool = False
-    wrong_number: bool = False
     asks_to_be_removed: bool = False
-    # Turn gaps, in seconds, sampled per turn.
     gap_range: tuple[float, float] = (4.0, 8.0)
     pickup_delay: float = 1.5
 
@@ -118,9 +116,7 @@ SCRIPTS: dict[str, ProspectScript] = {
         name="Voicemail",
         company="Ironwood Manufacturing",
         persona="voicemail box",
-        lines=[
-            "Hi you've reached {company}. Leave a message after the beep.",
-        ],
+        lines=["Hi you've reached {company}. Leave a message after the beep."],
         voicemail=True,
         speaking_rate=0.95,
         gap_range=(0.4, 0.8),
@@ -129,30 +125,26 @@ SCRIPTS: dict[str, ProspectScript] = {
 
 
 class SimulatedProspect:
-    """Yields the prospect's audio as a live 16 kHz mono PCM stream.
-
-    Paces itself so the agent gets a turn: after finishing a line it emits
-    silence long enough for the agent's reply to be generated, synthesized
-    and played out.
-    """
+    """Yields the prospect's audio as a live 16 kHz mono PCM stream."""
 
     def __init__(
         self,
         script: ProspectScript,
         tts: PiperTTS,
+        turns=None,
         turn_gap: float = 0.0,
         pickup_delay: Optional[float] = None,
         phone_filter: bool = True,
         seed: int = 0,
-        lock=None,
     ):
-        # The script supplies the persona; the lead supplies the identity, so
-        # a receptionist answers as the company actually called.
+        # The script supplies the persona; the lead supplies the identity, so a
+        # receptionist answers as the company actually called.
         self.script = script
         self.lines = [
             line.replace("{company}", script.company) for line in script.lines
         ]
         self.tts = tts
+        self.turns = turns
         self.turn_gap = turn_gap
         self.pickup_delay = (
             pickup_delay if pickup_delay is not None else script.pickup_delay
@@ -160,26 +152,6 @@ class SimulatedProspect:
         self.phone_filter = phone_filter
         self.rng = np.random.default_rng(seed)
         self._line_cache: dict[str, bytes] = {}
-
-        # Handshake with the agent: the prospect waits for a reply rather
-        # than assuming a fixed one.
-        self.agent_speaking = False
-        self.agent_turn_active = False
-        self._agent_idle = asyncio.Event()
-        self._agent_idle.set()
-        self.lock = lock
-
-    def agent_started_speaking(self) -> None:
-        """Called when the agent claims the line, before it generates."""
-        self.agent_speaking = True
-        self.agent_turn_active = True
-        self._agent_idle.clear()
-
-    def agent_finished_speaking(self) -> None:
-        """Called when the agent's turn is completely done."""
-        self.agent_speaking = False
-        self.agent_turn_active = False
-        self._agent_idle.set()
 
     def heard(self) -> list[str]:
         return list(self.lines)
@@ -202,41 +174,16 @@ class SimulatedProspect:
         return to_pcm(audio)
 
     def _gap_for(self, index: int) -> float:
-        """How long the prospect waits before speaking again.
+        """The pause before speaking again.
 
-        This is a *pause*, not the agent's speaking time. The agent's turn is
-        awaited separately via `wait_for_agent`; guessing a duration here is
-        what caused the agent to be talked over.
+        A pause, not the agent's speaking time. The agent's turn is waited on
+        separately via `TurnCoordinator`; guessing a duration here is what
+        caused the agent to be talked over.
         """
         low, high = self.script.gap_range
         if self.turn_gap:
             return self.turn_gap
         return float(max(MIN_TURN_GAP, self.rng.uniform(low, high)))
-
-    async def wait_for_agent(self, index: int) -> None:
-        """Block until the agent has finished its reply.
-
-        Used by tests and by any caller driving the prospect directly. The
-        streaming path uses `_wait_for_agent_chunks`, which keeps feeding
-        silence so the STT stays live.
-        """
-        await asyncio.sleep(self._gap_for(index))
-        loop = asyncio.get_event_loop()
-        start_wait = getattr(self, "_agent_turn_start_wait", AGENT_TURN_START_WAIT)
-        # Phase 1 gets its own budget; using the combined deadline here made
-        # the prospect sit out the full playback allowance waiting for a turn
-        # that never began.
-        start_deadline = loop.time() + start_wait
-        end_deadline = start_deadline + MAX_AGENT_WAIT
-        while not self.agent_turn_active and loop.time() < start_deadline:
-            await asyncio.sleep(0.02)
-        try:
-            await asyncio.wait_for(
-                self._agent_idle.wait(),
-                timeout=max(0.1, end_deadline - loop.time()),
-            )
-        except asyncio.TimeoutError:
-            logger.info("Agent did not finish its turn; prospect resumes anyway")
 
     async def _yield_pcm(self, pcm: bytes) -> AsyncIterator[bytes]:
         for offset in range(0, len(pcm), CHUNK_BYTES):
@@ -248,52 +195,18 @@ class SimulatedProspect:
             yield SILENCE
             await asyncio.sleep(CHUNK_MS / 1000)
 
-    async def _wait_for_agent_chunks(self, index: int) -> AsyncIterator[bytes]:
-        """Emit silence until the agent has finished replying.
-
-        Waiting only while the agent is *already* speaking was wrong. At the
-        moment the prospect stops talking, the agent has not started: the
-        STT still needs a beat of silence to fire, then a transcription
-        round trip, then model generation. Waiting on the current state
-        therefore returns immediately and the prospect talks straight over
-        the reply.
-
-        So: wait for the agent's turn to arrive, then for it to finish.
-        """
-        loop = asyncio.get_event_loop()
-        # Phase 1 budget: enough for endpointing + transcription + generation.
-        # Phase 2 budget: the turn itself, including playback.
-        start_wait = getattr(
-            self, "_agent_turn_start_wait", AGENT_TURN_START_WAIT
-        )
-        start_deadline = loop.time() + start_wait
-        end_deadline = start_deadline + MAX_AGENT_WAIT
-
-        # Phase 1: wait for the agent to claim the floor. Its turn starts
-        # only after endpointing and transcription, neither of which has
-        # happened yet.
-        while not self.agent_turn_active and loop.time() < start_deadline:
-            yield SILENCE
-            await asyncio.sleep(CHUNK_MS / 1000)
-
-        if not self.agent_turn_active:
-            logger.info("Agent never took the floor; prospect resumes")
-
-        # Phase 2: wait for that turn to finish playing.
-        while self.agent_turn_active and loop.time() < end_deadline:
-            yield SILENCE
-            await asyncio.sleep(CHUNK_MS / 1000)
-
-    async def _wait_silence(self, seconds: float) -> AsyncIterator[bytes]:
-        """Emit silence in real time while waiting for the agent.
+    async def _wait_while_speaking(self, deadline: float) -> AsyncIterator[bytes]:
+        """Emit silence while the agent holds the line.
 
         Must keep yielding chunks. The STT only runs when fed audio, and
-        endpointing needs the trailing silence to arrive as a stream — if this
-        blocked silently, the agent's reply would be glued onto the
-        prospect's last sentence and transcribed as one utterance.
+        endpointing needs trailing silence to arrive as a stream — blocking
+        silently would glue the agent's reply onto the prospect's last sentence
+        and transcribe the two as one utterance.
         """
-        deadline = asyncio.get_event_loop().time() + seconds
-        while asyncio.get_event_loop().time() < deadline:
+        loop = asyncio.get_event_loop()
+        while self.turns is not None and self.turns.agent_holding:
+            if loop.time() > deadline:
+                break
             yield SILENCE
             await asyncio.sleep(CHUNK_MS / 1000)
 
@@ -301,8 +214,6 @@ class SimulatedProspect:
         """Ring, pickup, then the conversation."""
         async for chunk in self._yield_silence(self.pickup_delay):
             yield chunk
-        if self.lock is not None:
-            self.lock.note_silence(self.pickup_delay)
 
         # A breath before anyone answers, unless it went to voicemail.
         if not self.script.voicemail:
@@ -315,53 +226,58 @@ class SimulatedProspect:
             async for chunk in self._yield_pcm(voicemail_beep()):
                 yield chunk
 
+        loop = asyncio.get_event_loop()
         for index, line in enumerate(self.lines):
-            if (
-                self.script.hangup_probability
-                and index > 0
-                and self.rng.random() < self.script.hangup_probability
-            ):
+            if (self.script.hangup_probability and index > 0
+                    and self.rng.random() < self.script.hangup_probability):
                 logger.info("Prospect hung up early at line %d", index)
                 break
 
-            # Half-duplex: the prospect may only talk on a free line. Acquiring
-            # blocks while the agent holds it — which now covers the agent's
-            # whole turn, generation and playback alike.
-            #
-            # `require_silence=False` because the silence gate is the *agent's*
-            # to clear: it stops the agent cutting in on a prospect who is
-            # still speaking. For the prospect it is a trap. Waiting means
-            # producing no audio, and silence is only credited from audio, so a
-            # prospect that waited for silence could only ever reach the
-            # threshold by not waiting — it sat out the full 30s lock timeout
-            # and had to be forced on every single turn. The holder is the
-            # authority here: the agent does not release until its audio has
-            # finished playing.
-            if self.lock is not None:
-                await self.lock.acquire(Speaker.PROSPECT, require_silence=False)
-
             async for chunk in self._yield_pcm(self._line_cache.get(line, b"")):
-                if self.lock is not None:
-                    self.lock.note_speech()
                 yield chunk
 
-            if self.lock is not None:
-                self.lock.release(Speaker.PROSPECT)
+            if index >= len(self.lines) - 1:
+                break
 
-            if index < len(self.lines) - 1:
-                # Keep the line fed with silence: first the natural pause,
-                # then whatever the agent takes to reply. The STT needs
-                # audio arriving continuously or it will not transcribe the
-                # reply at all.
-                async for chunk in self._wait_silence(self._gap_for(index)):
-                    yield chunk
-                if self.lock is not None:
-                    self.lock.note_silence(self._gap_for(index))
-                async for chunk in self._wait_for_agent_chunks(index):
-                    yield chunk
+            # Phase 1: the natural pause, then wait for the agent to claim the
+            # line. At the moment the prospect stops talking the agent has not
+            # started — endpointing and transcription have not happened yet —
+            # so waiting on "is it speaking?" would return immediately and the
+            # prospect would answer over the reply.
+            deadline = loop.time() + AGENT_TURN_START_WAIT
+            async for chunk in self._yield_silence(self._gap_for(index)):
+                yield chunk
+            async for chunk in self._wait_for_turn(deadline):
+                yield chunk
 
         # Line goes dead.
         async for chunk in self._yield_silence(1.0):
+            yield chunk
+
+    async def _wait_for_turn(self, start_deadline: float) -> AsyncIterator[bytes]:
+        """Wait for the agent's whole turn, emitting silence throughout.
+
+        Two phases because they are different failures. If the agent never
+        claims the line, waiting on it alone burns the entire playback budget
+        on a turn that does not exist. So: wait for the turn to *arrive*, then
+        wait for it to *finish*.
+        """
+        loop = asyncio.get_event_loop()
+        if self.turns is None:
+            return
+
+        # Phase 1: wait for the turn to be claimed.
+        while not self.turns.agent_holding and loop.time() < start_deadline:
+            yield SILENCE
+            await asyncio.sleep(CHUNK_MS / 1000)
+
+        if not self.turns.agent_holding:
+            logger.info("Agent never took the floor; prospect resumes")
+
+        # Phase 2: wait for that turn to finish playing.
+        async for chunk in self._wait_while_speaking(
+            loop.time() + MAX_AGENT_WAIT
+        ):
             yield chunk
 
 

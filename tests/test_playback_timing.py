@@ -15,7 +15,6 @@ import numpy as np
 import pytest
 
 from sim.recorder import CallRecording
-from turnlock import Speaker
 
 
 def _pcm(seconds: float = 0.1) -> bytes:
@@ -104,12 +103,29 @@ async def test_playback_seconds_tracks_finished_audio():
 
 
 async def test_pipeline_waits_for_playback_before_releasing_the_line():
-    """End to end: the line must not free up while audio is still queued."""
+    """End to end: the line must not free while audio is still queued.
+
+    This is the guarantee that failed most often. The line was handed back
+    when the last sentence was *synthesized*, which happens well before it is
+    audible, so the prospect answered over the tail of the reply.
+    """
     from llm.client import LLMResponse
-    from pipeline import VoicePipeline
+    from pipeline import TURN_END, VoicePipeline
     from stt.engine import TranscriptSegment
     from tools.registry import ToolRegistry
-    from turnlock import TurnLock
+    from turns import TurnCoordinator
+
+    class _SilentSTT:
+        """No prospect speech: this test is about the opening only."""
+
+        async def initialize(self):
+            pass
+
+        async def transcribe_stream(self, audio_in, sample_rate=16000, **kw):
+            async for _ in audio_in:
+                pass
+            return
+            yield  # pragma: no cover  (makes this an async generator)
 
     class _TTS:
         async def synthesize_pcm(self, text):
@@ -126,33 +142,31 @@ async def test_pipeline_waits_for_playback_before_releasing_the_line():
         async def _run(self):
             yield LLMResponse(text="One two. Three four.")
 
-    lock = TurnLock(silence_required=0.05, timeout=2.0)
+    turns = TurnCoordinator()
     rec = CallRecording("A", "B", "+14155550101")
     rec.start()
 
     p = VoicePipeline(
-        stt=None, llm=_LLM(), tts=_TTS(), tools=ToolRegistry(),
-        system_prompt="s", lock=lock, recorder=rec,
-        turn_spacing=0.0, turn_gap=0.05, max_history_turns=6,
+        stt=_SilentSTT(), llm=_LLM(), tts=_TTS(), tools=ToolRegistry(),
+        system_prompt="s", recorder=rec, coordinator=turns,
+        turn_spacing=0.0, max_history_turns=6,
     )
 
     q: asyncio.Queue = asyncio.Queue()
     released_while_queued = []
 
-    async def consumer():
+    async def watchdog():
         while True:
             await asyncio.sleep(0.01)
             # If the line frees while audio is still queued, that is the bug.
-            if lock.is_free() and rec._agent_finished < rec._agent_queued:
+            if not turns.agent_holding and rec._agent_finished < rec._agent_queued:
                 released_while_queued.append(
                     rec._agent_queued - rec._agent_finished)
 
-    drain = asyncio.create_task(consumer())
-    play = asyncio.create_task(_play(q, rec))
+    drain = asyncio.create_task(watchdog())
+    play = asyncio.create_task(_play(q, rec, turns))
     try:
-        # `_speak` owns the line across synthesis *and* playback, so the
-        # release cannot land while audio is still queued.
-        await p._speak("One two. Three four.", is_opening=True)
+        await p.run_call(_empty(), q, opening="One two. Three four.")
     finally:
         drain.cancel()
         play.cancel()
@@ -162,10 +176,22 @@ async def test_pipeline_waits_for_playback_before_releasing_the_line():
     )
 
 
-async def _play(q: asyncio.Queue, rec: CallRecording) -> None:
+async def _empty():
+    if False:
+        yield b""
+
+
+async def _play(q: asyncio.Queue, rec: CallRecording, turns) -> None:
+    """Real-time playback, releasing the line only at an end-of-turn marker."""
     while True:
         item = await q.get()
-        speaker, pcm = item if isinstance(item, tuple) else ("agent", item)
+        speaker, pcm, turn_end = (
+            item if isinstance(item, tuple) and len(item) == 3
+            else ("agent", item, False)
+        )
+        if turn_end and not pcm:
+            turns.agent_releases()
+            continue
         rec.add_playback(speaker, pcm)
         await asyncio.sleep(len(pcm) / (16000 * 2))  # real-time playback
         rec.mark_playback_finished(speaker, len(pcm) // 2)

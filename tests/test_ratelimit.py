@@ -126,3 +126,51 @@ async def test_turn_spacing_is_applied():
 async def _drain(q):
     while True:
         await q.get()
+
+
+def _daily_429():
+    """A 429 whose body names the per-day budget."""
+    from test_throttle_fallback import _rate_limited
+    exc = _rate_limited()
+    # The real body says "per day"; the classifier keys off that phrase.
+    return exc
+
+
+def test_daily_exhaustion_rotates_to_the_next_model():
+    """One model's spent budget must not end the call.
+
+    Groq budgets are per model, so qwen exhausting its daily allowance says
+    nothing about gpt-oss. Before this, the agent answered four turns in a row
+    with the hold line and booked nothing.
+    """
+    from llm.client import GroqLLM
+
+    llm = GroqLLM(
+        api_key="x",
+        model="qwen/qwen3.8-27b",
+        fallback_models=["openai/gpt-oss-120b"],
+        max_retries=0,
+    )
+    assert llm.active_model == "qwen/qwen3.8-27b"
+
+    assert llm._rotate_model() is True
+    assert llm.active_model == "openai/gpt-oss-120b"
+    assert "qwen/qwen3.8-27b" in llm._exhausted
+
+    # The exhausted model must not be retried.
+    assert llm._rotate_model() is False
+    assert llm.active_model == "openai/gpt-oss-120b"
+
+
+def test_rotation_skips_models_already_exhausted():
+    from llm.client import GroqLLM
+
+    llm = GroqLLM(
+        api_key="x",
+        model="a",
+        fallback_models=["b", "c"],
+        max_retries=0,
+    )
+    llm._exhausted.add("b")
+    assert llm._rotate_model() is True
+    assert llm.active_model == "c"

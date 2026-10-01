@@ -60,8 +60,16 @@ class GroqLLM:
         max_retry_wait: float = 45.0,
         retry_budget: float = 90.0,
         tokens_per_minute: int = 8000,
+        fallback_models: Optional[list] = None,
     ):
         self.model = model
+        # Groq budgets are per model, so one model exhausting its daily
+        # allowance says nothing about the others. A call should degrade to a
+        # slower model rather than end: the prospect is already on the line,
+        # and "sorry, one moment" repeated four times is worse than a slower
+        # answer.
+        self.fallback_models = list(fallback_models or [])
+        self._exhausted: set = set()
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.max_retries = max_retries
@@ -174,12 +182,19 @@ class GroqLLM:
                 if self.is_daily_exhausted(exc):
                     # A daily token budget will not clear on any timescale a
                     # live call can wait for. Retrying is pure dead air.
+                    #
+                    # But the budget is per model, so before giving up, try
+                    # the next one. A prospect already on the line would rather
+                    # have a slower answer than four repetitions of "one
+                    # moment".
+                    if self._rotate_model():
+                        return await self._with_backoff(coro_factory)
                     logger.error(
-                        "Daily token budget exhausted; not retrying. "
+                        "Daily token budget exhausted on every model; giving up. "
                         "The account's per-day limit resets on its own schedule."
                     )
                     raise DailyTokenLimitExceeded(
-                        "Groq daily token budget exhausted"
+                        "Groq daily token budget exhausted on all models"
                     ) from exc
                 elapsed = asyncio.get_event_loop().time() - started
                 if attempt == self.max_retries:
@@ -243,6 +258,27 @@ class GroqLLM:
             "cached": sum(u["cached"] for u in self.usage_log),
             "max_prompt": max(u["prompt"] for u in self.usage_log),
         }
+
+    @property
+    def active_model(self) -> str:
+        """The model currently in use, after any fallback."""
+        return self.model
+
+    def _rotate_model(self) -> bool:
+        """Move to the next untried model. False when there are none left.
+
+        The current model is excluded even though it is not yet recorded as
+        exhausted: without that, a second rotation would switch a model to
+        itself and report success.
+        """
+        for candidate in self.fallback_models:
+            if candidate != self.model and candidate not in self._exhausted:
+                logger.warning("Switching model %s -> %s (budget exhausted)",
+                               self.model, candidate)
+                self._exhausted.add(self.model)
+                self.model = candidate
+                return True
+        return False
 
     async def generate(
         self,
